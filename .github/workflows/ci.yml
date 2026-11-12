@@ -38,6 +38,17 @@ jobs:
           EDITOR_DISABLE_FEATURES: ${{ matrix.disable }}
         run: dotnet test tests/Editor.Core.Tests/Editor.Core.Tests.csproj -c Release --nologo
 
+  core-tests-windows:
+    name: Core tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Unit tests including atomic save and locking
+        run: dotnet test tests/Editor.Core.Tests/Editor.Core.Tests.csproj -c Release --nologo
+
   perf:
     name: Performance gates
     runs-on: windows-latest
@@ -85,7 +96,6 @@ jobs:
           -p:BaseIntermediateOutputPath=obj/msix/
           -p:AppxPackageDir=${{ github.workspace }}/artifacts/msix-${{ matrix.rid }}/
       - name: Test-sign MSIX
-        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -96,9 +106,14 @@ jobs:
           $password = ConvertTo-SecureString -String $secret -Force -AsPlainText
           $pfx = Join-Path $env:RUNNER_TEMP "editor-test.pfx"
           Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
-          $kit = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $signtool = Join-Path $kit.FullName "x64\signtool.exe"
-          & $signtool sign /fd SHA256 /f $pfx /p $secret $msix.FullName
+          Export-Certificate -Cert $cert -FilePath "artifacts/msix-${{ matrix.rid }}/EditorTest.cer" | Out-Null
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe was not found." }
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p $secret $msix.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
       - name: Publish portable
         run: >
           dotnet publish src/Editor.App/Editor.App.csproj -c Release
@@ -117,7 +132,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: editor-msix-${{ matrix.rid }}
-          path: artifacts/msix-${{ matrix.rid }}/**/*.msix
+          path: |
+            artifacts/msix-${{ matrix.rid }}/**/*.msix
+            artifacts/msix-${{ matrix.rid }}/EditorTest.cer
           if-no-files-found: error
       - name: Upload portable zip
         uses: actions/upload-artifact@v4
@@ -130,41 +147,51 @@ jobs:
     name: Cold start probe
     runs-on: windows-latest
     needs: package
-    continue-on-error: true
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: editor-portable-win-x64
           path: portable
-      - name: Measure startup when a window can be created
+      - name: Cold start must be measured and stay within 400 ms
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           $zip = Get-ChildItem portable -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "Portable zip was not produced." }
           Expand-Archive -Path $zip.FullName -DestinationPath unpacked
           $out = Join-Path (Get-Location) "artifacts/startup.json"
           $exe = Join-Path (Get-Location) "unpacked/Editor.exe"
-          if (-not (Test-Path $exe)) {
-            '{"kind":"missing-exe","elapsedMs":null}' | Set-Content $out
-            exit 0
-          }
-          $watch = [Diagnostics.Stopwatch]::StartNew()
+          if (-not (Test-Path $exe)) { throw "Editor.exe is missing from the portable zip." }
           $p = Start-Process -FilePath $exe -ArgumentList @("--startup-benchmark", $out) -PassThru
           if (-not $p.WaitForExit(25000)) {
-            $watch.Stop()
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            if (-not (Test-Path $out)) {
-              '{"kind":"timeout","elapsedMs":null,"note":"No usable window within 25s. Cold start is reported, not gated."}' | Set-Content $out
-            }
-          } else {
-            $watch.Stop()
+            throw "Editor did not report a first frame within 25s."
           }
-          Write-Host "outer elapsed ms: $($watch.Elapsed.TotalMilliseconds)"
-          if (Test-Path $out) { Get-Content $out }
+          if (-not (Test-Path $out)) { throw "Startup report was not written." }
+          $report = Get-Content $out -Raw | ConvertFrom-Json
+          Write-Host "cold start $($report.kind) $($report.elapsedMs) ms"
+          if ($null -eq $report.elapsedMs) { throw "Cold start was not measured." }
+          if ([double]$report.elapsedMs -gt 400) { throw "Cold start $($report.elapsedMs) ms exceeds 400 ms." }
+      - name: App starts with every feature off
+        shell: pwsh
+        env:
+          EDITOR_DISABLE_FEATURES: "*"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path (Get-Location) "artifacts/startup-flags-off.json"
+          $exe = Join-Path (Get-Location) "unpacked/Editor.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList @("--startup-benchmark", $out) -PassThru
+          if (-not $p.WaitForExit(25000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "Editor did not start with all features off."
+          }
+          if (-not (Test-Path $out)) { throw "Flag-off startup report was not written." }
+          Get-Content $out
       - name: Upload startup report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: startup-report
-          path: artifacts/startup.json
+          path: artifacts/startup*.json
           if-no-files-found: warn

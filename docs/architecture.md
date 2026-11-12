@@ -66,7 +66,7 @@ Backspace and Delete remove one grapheme, or join the neighboring lines at the e
 
 Find and replace are literal. Match case is ordinal or ordinal-ignore-case. Matches do not overlap. An empty pattern matches nothing. `RegexTextSearcher` is the extension point and throws `NotSupportedException` until a later milestone.
 
-`GetText` refuses documents larger than 64 MiB. Find uses that snapshot, so find on a larger document fails with the same limit rather than scanning forever. With the feature off, find returns no matches and replace changes nothing.
+Find walks the document in byte windows and keeps the last `pattern.Length - 1` characters, so a match that crosses a window is reported once, including when the window ends inside a multibyte character. A cancelled search, or a search whose document changes between windows, throws and does not return a partial list. The find bar runs that work off the UI thread. `GetText` and pattern movement still refuse a document larger than 64 MiB. With the feature off, find returns no matches and replace changes nothing.
 
 Go to line is 1-based, clamps to the scanned line count, and moves the caret when the feature is on. When it is off, the call returns false and the caret stays.
 
@@ -76,7 +76,11 @@ Go to line is 1-based, clamps to the scanned line count, and moves the caret whe
 
 With atomic save off, the same access check runs, and the write then goes to the destination directly.
 
-A modified memory-mapped file that is saved back to the same path cannot replace the file while the map is open. That path encodes to a temp file, unmaps, replaces, and reopens the result. Reopening clears undo. This is the one save path that drops the undo stack. Unmodified saves of a mapped file copy the original bytes and do not clear undo.
+A modified memory-mapped file that is saved back to the same path cannot be replaced while the map is open. The save copies the original bytes into a private backing file when the live piece table or the undo stack still names them, unmaps, then replaces the destination. Piece offsets now name the backing file, so undo and redo stay valid. The destination replace is still atomic when that flag is on. A later save of the same path uses the normal writer, because the destination is no longer the mapped source. The backing file is removed when the document is disposed. Unmodified saves copy the original bytes.
+
+A modifying save copies unedited original pieces as raw bytes and encodes only the new text. If the encoding was a provisional guess from the first 64 KiB, the save first rechecks the whole original file. A later byte that is not UTF-8 selects ANSI, and the unedited bytes are still copied rather than replaced with a fallback character. Save As can choose UTF-8, UTF-8 with BOM, UTF-16 LE, UTF-16 BE, or ANSI, and CRLF, LF, or CR. ANSI uses the system code page.
+
+Ctrl+End, Go to a line far from the indexed prefix, and a scrollbar jump use a short probe around an estimated byte offset. They do not walk the line index from the start of a large file. The line number on that path is an estimate.
 
 ## Feature flags
 
@@ -113,4 +117,4 @@ The WinUI types are wrappers: `EditorAutomationPeer` implements `ITextProvider2`
 
 ## Out of this milestone
 
-Regular-expression search, word wrap, printing, drag-and-drop, multiple windows, a recent-file list, encoding conversion, and double-width emoji columns are not in this slice. Pattern movement and find on a document larger than 64 MiB are refused. Ctrl+End and Go to a line near the end of a multi-gigabyte file scan forward. Saving a modified memory-mapped file in place clears undo.
+Regular-expression search, word wrap, printing, drag-and-drop, multiple windows, a recent-file list, and double-width emoji columns are not in this slice. `GetText` and pattern movement refuse a document larger than 64 MiB. Drag-and-drop, wide-glyph column width, scroll-rate gates, and moving GitHub Actions off Node 20 are tracked for a later milestone.

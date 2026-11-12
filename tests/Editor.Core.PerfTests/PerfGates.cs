@@ -22,7 +22,7 @@ public sealed class PerfLog : IDisposable
         var payload = new
         {
             recordedUtc = DateTime.UtcNow,
-            coldStart = "Recorded by the Windows package job when a window can be created; not a failing gate.",
+            coldStart = "Gated at 400 ms by the Windows cold-start job. Linux timings are not the acceptance numbers.",
             rows = Rows
         };
         File.WriteAllText(path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
@@ -142,6 +142,101 @@ public sealed class PerfGates : IClassFixture<PerfLog>
         var max = samples[^1];
         _log.Rows.Add(new PerfRow("insert-middle-1gb", median, 16, 0, 0, size, $"max={max:F3}"));
         Assert.True(median <= 16, $"median insert {median:F3} ms, max {max:F3} ms (limit 16)");
+    }
+
+    [Fact]
+    public void Open_1mb_reaches_first_page_within_100ms()
+    {
+        const long size = 1024L * 1024;
+        var path = Path.Combine(_log.Root, "one.txt");
+        WritePattern(path, size);
+        Warmup();
+        var clock = Stopwatch.StartNew();
+        using var document = TextDocument.Open(path);
+        var page = document.LayoutFirstPage(40, 80);
+        clock.Stop();
+        _log.Rows.Add(new PerfRow("open-1mb", clock.Elapsed.TotalMilliseconds, 100, 0, 0, size, $"scanned={document.ScannedBytes}"));
+        Assert.True(page.Lines.Count > 0);
+        Assert.False(document.IsLineIndexComplete);
+        Assert.True(document.ScannedBytes < 256 * 1024);
+        Assert.True(clock.Elapsed.TotalMilliseconds <= 100, $"1 MB open took {clock.Elapsed.TotalMilliseconds:F1} ms");
+    }
+
+    [Fact]
+    public void Single_10mb_line_lays_out_the_first_page_without_reading_the_line()
+    {
+        const long size = 10L * 1024 * 1024;
+        var path = Path.Combine(_log.Root, "oneline.txt");
+        using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            var block = new byte[1024 * 1024];
+            Array.Fill(block, (byte)'a');
+            for (var i = 0; i < 10; i++)
+                stream.Write(block);
+        }
+
+        Warmup();
+        var clock = Stopwatch.StartNew();
+        using var document = TextDocument.Open(path);
+        var page = document.LayoutFirstPage(20, 80);
+        clock.Stop();
+        _log.Rows.Add(new PerfRow("open-10mb-line", clock.Elapsed.TotalMilliseconds, 100, 0, 0, size, $"scanned={page.BytesScanned}; chars={page.Lines[0].Text.Length}"));
+        Assert.True(page.Lines.Count > 0);
+        Assert.True(page.Lines[0].Text.Length <= 80);
+        Assert.True(page.BytesScanned < 256 * 1024);
+        Assert.False(document.IsLineIndexComplete);
+        Assert.True(clock.Elapsed.TotalMilliseconds <= 100, $"10 MB line took {clock.Elapsed.TotalMilliseconds:F1} ms");
+    }
+
+    [Fact]
+    public void Find_on_100mb_reaches_a_marker_at_the_end()
+    {
+        const long size = 100L * 1024 * 1024;
+        var path = Path.Combine(_log.Root, "find100.txt");
+        WritePattern(path, size - 6);
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.None))
+            stream.Write(Encoding.ASCII.GetBytes("NEEDLE"));
+
+        Warmup();
+        using var document = TextDocument.Open(path);
+        var clock = Stopwatch.StartNew();
+        var matches = document.Find("NEEDLE", FindOptions.Plain(matchCase: true));
+        clock.Stop();
+        _log.Rows.Add(new PerfRow("find-100mb", clock.Elapsed.TotalMilliseconds, 2000, 0, 0, size, $"matches={matches.Count}"));
+        Assert.Single(matches);
+        Assert.True(clock.Elapsed.TotalMilliseconds <= 2000, $"find took {clock.Elapsed.TotalMilliseconds:F1} ms");
+    }
+
+    [Fact]
+    public void End_goto_and_scroll_jump_on_1gb_stay_within_100ms()
+    {
+        const long size = 1024L * 1024 * 1024;
+        var path = Corpus(size, "gig.txt");
+        Warmup();
+        using var document = TextDocument.Open(path);
+        _ = document.LayoutFirstPage(10, 40);
+        var scanned = document.ScannedBytes;
+
+        var clock = Stopwatch.StartNew();
+        var end = document.JumpToEnd();
+        var line = document.JumpToLine(5_000_000);
+        var scroll = document.JumpToFraction(0.95);
+        clock.Stop();
+
+        _log.Rows.Add(new PerfRow(
+            "jump-1gb",
+            clock.Elapsed.TotalMilliseconds,
+            100,
+            0,
+            0,
+            size,
+            $"endTouched={end.BytesTouched}; lineTouched={line.BytesTouched}; scrollTouched={scroll.BytesTouched}; scanned={document.ScannedBytes}"));
+        Assert.Equal(scanned, document.ScannedBytes);
+        Assert.False(document.IsLineIndexComplete);
+        Assert.True(end.BytesTouched < 1_000_000);
+        Assert.True(line.BytesTouched < 1_000_000);
+        Assert.True(scroll.BytesTouched < 1_000_000);
+        Assert.True(clock.Elapsed.TotalMilliseconds <= 100, $"jumps took {clock.Elapsed.TotalMilliseconds:F1} ms");
     }
 
     private string Corpus(long size, string name)

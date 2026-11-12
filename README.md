@@ -44,7 +44,9 @@ On Windows the app reads `%LocalAppData%\Editor\settings.json`.
 
 ## Continuous integration
 
-GitHub Actions runs the unit tests on Linux, repeats them with each feature name in `EDITOR_DISABLE_FEATURES`, runs the performance gates on Windows, and publishes an unsigned MSIX plus a self-contained portable zip for `win-x64` and `win-arm64`. A test signature is attempted and is not required. Cold start is measured when the runner can open a window, and a miss is recorded rather than failed.
+GitHub Actions runs the unit tests on Linux and Windows, repeats them on Linux with each feature name in `EDITOR_DISABLE_FEATURES`, runs the performance gates on Windows, and publishes a test-signed MSIX plus a self-contained portable zip for `win-x64` and `win-arm64`. The certificate is created in CI. See `docs/test-signing.md` to install it. Cold start is a 400 ms gate. ANSI uses the system code page.
+
+Drag-and-drop, wide-glyph columns, scroll-rate gates, and moving the GitHub Actions off Node 20 are later milestones.
 
 Performance gates, measured in the core library without a window:
 

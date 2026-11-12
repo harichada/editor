@@ -10,6 +10,7 @@ public sealed class EditingSession
     private int _anchorLine;
     private int _anchorColumn;
     private int _preferredColumn;
+    private string _remotePreview = string.Empty;
 
     public EditingSession(TextDocument document)
     {
@@ -23,13 +24,29 @@ public sealed class EditingSession
     public int AnchorLine => _anchorLine;
     public int AnchorColumn => _anchorColumn;
     public int PageLineCount { get; set; }
+    public bool HasRemoteCaret { get; private set; }
+    public long RemoteViewByte { get; private set; }
 
     public bool HasSelection => CaretLine != _anchorLine || CaretColumn != _anchorColumn;
 
     public int CaretUtf16 => DocumentCoordinates.ToUtf16(Document, CaretLine, CaretColumn);
 
+    public bool GoToLine(int lineNumber)
+    {
+        if (!Document.TryGoToLine(lineNumber, out _))
+            return false;
+        PlaceJump(Document.LastJump, extend: false);
+        return true;
+    }
+
     public void Move(CaretMove move, bool extend)
     {
+        if (HasRemoteCaret && move != CaretMove.DocumentEnd)
+        {
+            MoveRemote(move, extend);
+            return;
+        }
+
         var line = CaretLine;
         var column = CaretColumn;
         var content = LineOrEmpty(line);
@@ -104,11 +121,8 @@ public sealed class EditingSession
                 _preferredColumn = 0;
                 break;
             case CaretMove.DocumentEnd:
-                Document.EnsureLines(int.MaxValue);
-                line = Math.Max(0, LineCount() - 1);
-                column = LineOrEmpty(line).Length;
-                _preferredColumn = DisplayColumn.Get(LineOrEmpty(line), column);
-                break;
+                PlaceJump(Document.JumpToEnd(), extend);
+                return;
             case CaretMove.PageUp:
                 line = Math.Max(0, line - Math.Max(1, PageLineCount));
                 column = DisplayColumn.Utf16At(LineOrEmpty(line), _preferredColumn);
@@ -277,6 +291,69 @@ public sealed class EditingSession
         _anchorColumn = GraphemeNavigator.SnapBack(LineOrEmpty(_anchorLine), _anchorColumn);
     }
 
+    private void PlaceJump(JumpTarget target, bool extend)
+    {
+        if (target.Exact)
+        {
+            HasRemoteCaret = false;
+            SetCaret(target.Line, target.Column, extend);
+            return;
+        }
+
+        HasRemoteCaret = true;
+        RemoteViewByte = target.LineStart;
+        _remotePreview = target.Preview ?? string.Empty;
+        CaretLine = target.Line;
+        CaretColumn = Math.Clamp(target.Column, 0, _remotePreview.Length);
+        _preferredColumn = DisplayColumn.Get(_remotePreview, CaretColumn);
+        if (!extend)
+        {
+            _anchorLine = CaretLine;
+            _anchorColumn = CaretColumn;
+        }
+    }
+
+    private void MoveRemote(CaretMove move, bool extend)
+    {
+        if (move == CaretMove.DocumentStart)
+        {
+            HasRemoteCaret = false;
+            SetCaret(0, 0, extend);
+            return;
+        }
+
+        var column = CaretColumn;
+        var content = _remotePreview;
+        switch (move)
+        {
+            case CaretMove.Left:
+            case CaretMove.WordLeft:
+                column = move == CaretMove.WordLeft
+                    ? GraphemeNavigator.PreviousWord(content, column)
+                    : GraphemeNavigator.Previous(content, column);
+                break;
+            case CaretMove.Right:
+            case CaretMove.WordRight:
+                column = move == CaretMove.WordRight
+                    ? GraphemeNavigator.NextWord(content, column)
+                    : GraphemeNavigator.Next(content, column);
+                break;
+            case CaretMove.LineStart:
+                column = 0;
+                break;
+            case CaretMove.LineEnd:
+                column = content.Length;
+                break;
+        }
+
+        CaretColumn = GraphemeNavigator.SnapBack(content, Math.Clamp(column, 0, content.Length));
+        if (!extend)
+        {
+            _anchorLine = CaretLine;
+            _anchorColumn = CaretColumn;
+        }
+    }
+
     private int LineCount()
     {
         Document.EnsureLines(CaretLine + 2);
@@ -286,6 +363,10 @@ public sealed class EditingSession
 
     private string LineOrEmpty(int line)
     {
+        if (HasRemoteCaret && line == CaretLine)
+            return _remotePreview;
+        if (Document.ByteLength > 256 * 1024 && line > Document.CompleteLineCount + 8)
+            return _remotePreview;
         Document.EnsureLines(line + 1);
         if (line < 0 || line >= Document.CompleteLineCount)
             return string.Empty;

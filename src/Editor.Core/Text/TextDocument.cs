@@ -25,11 +25,14 @@ public readonly record struct DocumentStatus(int Line, int Column, string Encodi
 /// A single plain-text document. Storage is a piece table: the original bytes stay
 /// immutable and edits are appended. An unmodified save copies those bytes exactly.
 /// </summary>
-public sealed class TextDocument : IDisposable
+public sealed partial class TextDocument : IDisposable
 {
     public const long MapThreshold = 1_048_576;
     public const long MaterializeLimit = 64L * 1024 * 1024;
+    internal const int DefaultSearchWindowBytes = 1024 * 1024;
+    private const long ExactJumpLimit = 256 * 1024;
 
+    private readonly object _gate = new();
     private readonly EditorSettings _settings;
     private readonly PieceTable _table = new();
     private readonly AddBuffer _add = new();
@@ -38,10 +41,14 @@ public sealed class TextDocument : IDisposable
     private readonly Stack<HistoryEntry> _redo = new();
 
     private IByteSource _source;
+    private string? _sourcePath;
+    private string? _backingPath;
     private int _revision;
     private int _savedRevision;
     private long _logicalAdd;
     private bool _disposed;
+    private bool _transcodeAll;
+    private bool _coalesce;
 
     private TextDocument(EditorSettings settings, IByteSource source, string? path)
     {
@@ -67,7 +74,7 @@ public sealed class TextDocument : IDisposable
     /// True when the buffer differs from the bytes it was loaded or last saved from.
     /// A new empty document is clean. Undo back to that baseline clears the flag.
     /// </summary>
-    public bool IsModified => _revision != _savedRevision;
+    public bool IsModified => _revision != _savedRevision || _transcodeAll;
 
     public string DisplayName => FilePath is null ? "Untitled" : Path.GetFileName(FilePath);
 
@@ -122,6 +129,8 @@ public sealed class TextDocument : IDisposable
         }
 
         var document = new TextDocument(settings, source, path);
+        if (source is MappedByteSource)
+            document._sourcePath = document.FilePath;
         try
         {
             document.LoadOriginal(ReadPrefix(source));
@@ -136,11 +145,20 @@ public sealed class TextDocument : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-        _disposed = true;
-        _source.Dispose();
-        _source = EmptyByteSource.Instance;
+        string? backing;
+        lock (_gate)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            backing = _backingPath;
+            _backingPath = null;
+            _sourcePath = null;
+            _source.Dispose();
+            _source = EmptyByteSource.Instance;
+        }
+        if (backing is not null)
+            TryDelete(backing);
     }
 
     public string GetText()
@@ -299,22 +317,28 @@ public sealed class TextDocument : IDisposable
 
     public bool Undo()
     {
-        if (_undo.Count == 0)
-            return false;
-        var current = Capture();
-        Restore(_undo.Pop());
-        _redo.Push(current);
-        return true;
+        lock (_gate)
+        {
+            if (_undo.Count == 0)
+                return false;
+            var current = Capture();
+            Restore(_undo.Pop());
+            _redo.Push(current);
+            return true;
+        }
     }
 
     public bool Redo()
     {
-        if (_redo.Count == 0)
-            return false;
-        var current = Capture();
-        Restore(_redo.Pop());
-        _undo.Push(current);
-        return true;
+        lock (_gate)
+        {
+            if (_redo.Count == 0)
+                return false;
+            var current = Capture();
+            Restore(_redo.Pop());
+            _undo.Push(current);
+            return true;
+        }
     }
 
     public void ConvertLineEndings(LineEndingKind target)
@@ -335,31 +359,290 @@ public sealed class TextDocument : IDisposable
         });
     }
 
-    public IReadOnlyList<SearchMatch> Find(string pattern, FindOptions options)
+    public IReadOnlyList<SearchMatch> Find(string pattern, FindOptions options, CancellationToken cancellationToken = default) =>
+        Find(pattern, options, cancellationToken, DefaultSearchWindowBytes);
+
+    /// <summary>
+    /// The next non-overlapping match at or after <paramref name="fromUtf16"/>.
+    /// If none remains, the first match in the document, so Find Next wraps.
+    /// The scan covers the whole document. A match that crosses a decode window is kept.
+    /// </summary>
+    public SearchMatch? FindNext(string pattern, FindOptions options, int fromUtf16, CancellationToken cancellationToken = default) =>
+        FindNext(pattern, options, fromUtf16, cancellationToken, DefaultSearchWindowBytes);
+
+    internal IReadOnlyList<SearchMatch> Find(string pattern, FindOptions options, CancellationToken cancellationToken, int windowChars)
     {
-        if (!_settings.Features.FindReplace)
+        if (!CanSearch(pattern, options))
             return [];
-        if (string.IsNullOrEmpty(pattern))
-            return [];
-        return TextSearcherFactory.Create(options).Find(GetText(), pattern, options);
+        var (expected, length) = CaptureSearch();
+        return StreamingTextSearch.FindAll(
+            (position, count) => ReadSearchWindow(position, count, expected),
+            length,
+            pattern,
+            Comparison(options),
+            windowChars,
+            cancellationToken);
     }
 
-    public int ReplaceAll(string pattern, string replacement, FindOptions options)
+    internal SearchMatch? FindNext(string pattern, FindOptions options, int fromUtf16, CancellationToken cancellationToken, int windowChars)
     {
-        if (!_settings.Features.FindReplace)
+        if (!CanSearch(pattern, options))
+            return null;
+        if (fromUtf16 < 0)
+            fromUtf16 = 0;
+        var (expected, length) = CaptureSearch();
+        return StreamingTextSearch.FindNext(
+            (position, count) => ReadSearchWindow(position, count, expected),
+            length,
+            pattern,
+            Comparison(options),
+            windowChars,
+            fromUtf16,
+            cancellationToken);
+    }
+
+    public int ReplaceAll(string pattern, string replacement, FindOptions options, CancellationToken cancellationToken = default) =>
+        ReplaceAll(pattern, replacement, options, cancellationToken, DefaultSearchWindowBytes);
+
+    internal int ReplaceAll(string pattern, string replacement, FindOptions options, CancellationToken cancellationToken, int windowChars)
+    {
+        if (!CanSearch(pattern, options))
             return 0;
-        if (string.IsNullOrEmpty(pattern))
-            return 0;
-        var current = GetText();
-        var updated = TextSearcherFactory.Create(options).Replace(current, pattern, replacement ?? string.Empty, options, out var count);
-        if (count == 0)
-            return 0;
-        Mutate(() =>
+        replacement ??= string.Empty;
+        lock (_gate)
         {
-            ReplaceAll(updated);
-            RefreshEndings(ByteLength <= 256 * 1024);
-        });
-        return count;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
+            var temp = Path.Combine(Path.GetTempPath(), "editor-replace-" + Guid.NewGuid().ToString("n"));
+            int count;
+            try
+            {
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536))
+                {
+                    count = StreamingTextSearch.Replace(
+                        (position, chars) =>
+                        {
+                            var window = DecodeByteWindow(position, chars);
+                            return new StreamingTextSearch.DecodedWindow(window.Text, window.BytesConsumed);
+                        },
+                        _table.Length,
+                        pattern,
+                        replacement,
+                        Comparison(options),
+                        windowChars,
+                        stream,
+                        cancellationToken);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                if (count == 0)
+                    return 0;
+
+                MutateUnlocked(() =>
+                {
+                    AdoptReplacement(temp);
+                    RefreshEndings(_table.Length <= 256 * 1024);
+                });
+                return count;
+            }
+            finally
+            {
+                TryDelete(temp);
+            }
+        }
+    }
+
+    private bool CanSearch(string pattern, FindOptions options)
+    {
+        if (!_settings.Features.FindReplace || string.IsNullOrEmpty(pattern))
+            return false;
+        if (options.Mode == SearchMode.Regex)
+            throw new NotSupportedException("Regular expression search is not available until M2.");
+        return true;
+    }
+
+    private static StringComparison Comparison(FindOptions options) =>
+        options.MatchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
+    private (int Revision, long Length) CaptureSearch()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return (_revision, _table.Length);
+        }
+    }
+
+    private StreamingTextSearch.DecodedWindow ReadSearchWindow(long position, int maxChars, int expectedRevision)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_revision != expectedRevision)
+                throw new OperationCanceledException("The document changed while it was being searched.");
+            var window = DecodeByteWindow(position, maxChars);
+            return new StreamingTextSearch.DecodedWindow(window.Text, window.BytesConsumed);
+        }
+    }
+
+    /// <summary>
+    /// Decode up to <paramref name="maxBytes"/> document bytes, stopping on a character boundary.
+    /// A requested window that ends inside a multibyte character does not consume that character;
+    /// the next window starts at its first byte, so the character is reported once.
+    /// </summary>
+    private (string Text, int BytesConsumed) DecodeByteWindow(long bytePos, int maxBytes)
+    {
+        if (maxBytes < 1)
+            maxBytes = 1;
+        if (bytePos >= _table.Length)
+            return (string.Empty, 0);
+
+        var builder = new StringBuilder();
+        var consumed = 0;
+        var position = bytePos;
+        var limit = Math.Min(_table.Length, bytePos + maxBytes);
+        while (position < limit)
+        {
+            if (!_table.TryGetSpan(position, out var span) || span.Length <= 0)
+                break;
+            var room = (int)Math.Min(span.Length, limit - position);
+            if (room <= 0)
+                break;
+            var atEnd = position + room >= _table.Length;
+            var take = TakeComplete(position, span, room, atEnd);
+            if (take <= 0)
+            {
+                if (consumed > 0)
+                    break;
+                var wider = (int)Math.Min(span.Length, 8);
+                take = TakeComplete(position, span, wider, position + wider >= _table.Length);
+                if (take <= 0)
+                    take = 1;
+            }
+
+            AppendDecoded(builder, position, span, take);
+            consumed += take;
+            position += take;
+            if (position > limit && consumed > take)
+                break;
+            if (take < room)
+                break;
+        }
+
+        return (builder.ToString(), consumed);
+    }
+
+    private int TakeComplete(long position, PieceSpan span, int room, bool atEnd)
+    {
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(room);
+        try
+        {
+            var buffer = rented.AsSpan(0, room);
+            CopySpan(span, buffer);
+            return span.Piece.Encoding switch
+            {
+                BufferEncoding.Utf16Le => CompleteUtf16(buffer, atEnd, littleEndian: true),
+                BufferEncoding.Utf16Be => CompleteUtf16(buffer, atEnd, littleEndian: false),
+                BufferEncoding.Ansi => room,
+                _ => CompleteUtf8(buffer, atEnd)
+            };
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private void AppendDecoded(StringBuilder builder, long position, PieceSpan span, int take)
+    {
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(take);
+        try
+        {
+            var buffer = rented.AsSpan(0, take);
+            CopySpan(span, buffer);
+            builder.Append(span.Piece.Encoding switch
+            {
+                BufferEncoding.Utf16Le => System.Text.Encoding.Unicode.GetString(buffer),
+                BufferEncoding.Utf16Be => System.Text.Encoding.BigEndianUnicode.GetString(buffer),
+                BufferEncoding.Ansi => AnsiEncodings.Get(Encoding.AnsiCodePage).GetString(buffer),
+                _ => System.Text.Encoding.UTF8.GetString(buffer)
+            });
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        _ = position;
+    }
+
+    private void CopySpan(PieceSpan span, Span<byte> destination)
+    {
+        if (span.Piece.Source == PieceSource.Original)
+            _source.CopyTo(span.SourceOffset, destination);
+        else
+            _add.CopyTo(span.SourceOffset, destination);
+    }
+
+    private static int CompleteUtf8(ReadOnlySpan<byte> data, bool atEnd)
+    {
+        var index = 0;
+        var good = 0;
+        while (index < data.Length)
+        {
+            var lead = data[index];
+            var size = 1;
+            if (lead >= 0xC2 && lead <= 0xDF)
+                size = 2;
+            else if (lead >= 0xE0 && lead <= 0xEF)
+                size = 3;
+            else if (lead >= 0xF0 && lead <= 0xF4)
+                size = 4;
+            if (index + size > data.Length)
+                return atEnd ? data.Length : good;
+            good = index + size;
+            index += size;
+        }
+        return good;
+    }
+
+    private static int CompleteUtf16(ReadOnlySpan<byte> data, bool atEnd, bool littleEndian)
+    {
+        if (data.Length < 2)
+            return atEnd ? data.Length : 0;
+        var even = data.Length & ~1;
+        if (!atEnd && even >= 2)
+        {
+            var unit = littleEndian
+                ? (char)(data[even - 2] | (data[even - 1] << 8))
+                : (char)((data[even - 2] << 8) | data[even - 1]);
+            if (char.IsHighSurrogate(unit))
+                even -= 2;
+        }
+        return even;
+    }
+
+    private void AdoptReplacement(string tempPath)
+    {
+        long start = _add.Length;
+        var buffer = ArrayPool<byte>.Shared.Rent(1024 * 1024);
+        try
+        {
+            using var stream = new FileStream(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                _add.Append(buffer.AsSpan(0, read));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+        _logicalAdd = _add.Length;
+        _table.Clear();
+        var length = _add.Length - start;
+        if (length > 0)
+            _table.Insert(0, new Piece(PieceSource.Add, start, length, BufferEncoding.Utf8));
+        _index.Reset();
     }
 
     public bool TryGoToLine(int lineNumber, out int zeroBasedLine)
@@ -369,9 +652,8 @@ public sealed class TextDocument : IDisposable
             return false;
         if (lineNumber < 1)
             lineNumber = 1;
-        EnsureLines(lineNumber);
-        var count = Math.Max(CompleteLineCount, 1);
-        zeroBasedLine = Math.Min(lineNumber, count) - 1;
+        LastJump = JumpToLine(lineNumber - 1);
+        zeroBasedLine = LastJump.Line;
         return true;
     }
 
@@ -381,6 +663,15 @@ public sealed class TextDocument : IDisposable
             return null;
         if (line < 0)
             line = 0;
+        if (line > CompleteLineCount + 8 && ByteLength > ExactJumpLimit)
+        {
+            return new DocumentStatus(
+                line + 1,
+                utf16Column + 1,
+                Encoding.Label,
+                LineEndings.Label,
+                IsModified);
+        }
         EnsureLines(line + 1);
         var last = Math.Max(0, CompleteLineCount - 1);
         if (line > last)
@@ -421,7 +712,7 @@ public sealed class TextDocument : IDisposable
         var count = Math.Min(maxLines, available);
         for (var i = 0; i < count; i++)
         {
-            var text = GraphemeNavigator.Trim(GetLineContent(i), maxColumns);
+            var text = ReadLinePrefix(i, maxColumns);
             lines.Add(new PageLine { LineNumber = i, Text = text, DisplayColumns = DisplayColumn.Count(text) });
         }
 
@@ -435,28 +726,29 @@ public sealed class TextDocument : IDisposable
 
     public void Save(string path)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        var full = Path.GetFullPath(path);
-        var same = FilePath is not null && PathsEqual(FilePath, full);
-        if (!IsModified && same)
-            return;
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var full = Path.GetFullPath(path);
+            var same = FilePath is not null && PathsEqual(FilePath, full);
+            if (!IsModified && same)
+                return;
 
-        var atomic = _settings.Features.AtomicSave;
-        if (_revision == 0 && _source.Length >= 0 && FilePath is not null)
-            CopyOriginal(full, atomic);
-        else if (_revision == 0 && _source is OwnedByteSource && FilePath is null && _undo.Count == 0)
-            CopyOriginal(full, atomic);
-        else if (_source is MappedByteSource && same)
-            SaveMappedInPlace(full);
-        else
-            AtomicFileWriter.Write(full, atomic, stream => TextCodec.Write(stream, _table, _source, _add, Encoding));
+            var atomic = _settings.Features.AtomicSave;
+            if (_revision == 0 && !_transcodeAll && _source.Length >= 0 && FilePath is not null)
+                CopyOriginal(full, atomic);
+            else if (_revision == 0 && !_transcodeAll && _source is OwnedByteSource && FilePath is null && _undo.Count == 0)
+                CopyOriginal(full, atomic);
+            else if (IsMapping(full))
+                SaveOverMappedFile(full, atomic);
+            else
+                AtomicFileWriter.Write(full, atomic, WriteDocument);
 
-        if (_source is MappedByteSource && same && _revision != 0)
-            return;
-
-        FilePath = full;
-        _savedRevision = _revision;
+            FilePath = full;
+            _savedRevision = _revision;
+            _transcodeAll = false;
+        }
     }
 
     private void LoadOriginal(byte[] prefix)
@@ -481,11 +773,28 @@ public sealed class TextDocument : IDisposable
 
     private void Mutate(Action change)
     {
+        lock (_gate)
+        {
+            _coalesce = false;
+            MutateUnlocked(change);
+        }
+    }
+
+    private void MutateUnlocked(Action change)
+    {
         var entry = Capture();
         _redo.Clear();
         // Drop bytes that belonged only to the redo branch, then append the new edit.
         _add.Truncate(_logicalAdd);
-        change();
+        try
+        {
+            change();
+        }
+        catch
+        {
+            Restore(entry);
+            throw;
+        }
         _undo.Push(entry);
         _revision++;
     }
@@ -705,48 +1014,169 @@ public sealed class TextDocument : IDisposable
         });
     }
 
-    private void SaveMappedInPlace(string full)
+    private bool IsMapping(string full) =>
+        _source is MappedByteSource && _sourcePath is not null && PathsEqual(_sourcePath, full);
+
+    /// <summary>
+    /// The destination is the file currently mapped as the original byte source.
+    /// Piece offsets in the live table and in the undo stack name bytes in that
+    /// file, so those bytes are copied to a private backing file before the
+    /// destination is replaced. Undo keeps working, and the replace stays atomic
+    /// when that flag is on.
+    /// </summary>
+    private void SaveOverMappedFile(string full, bool atomic)
     {
         if (File.Exists(full) && (File.GetAttributes(full) & FileAttributes.ReadOnly) != 0)
             throw new IOException($"Cannot save. The file is read-only: {full}");
 
         var directory = Path.GetDirectoryName(full) ?? ".";
         var temp = Path.Combine(directory, "." + Path.GetFileName(full) + "." + Guid.NewGuid().ToString("n") + ".tmp");
+        string? backing = null;
+        var unmapped = false;
+        var replaced = false;
         try
         {
             using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.WriteThrough))
             {
-                TextCodec.Write(stream, _table, _source, _add, Encoding);
+                WriteDocument(stream);
                 stream.Flush(flushToDisk: true);
             }
 
+            if (HistoryReferencesOriginal())
+                backing = CopySourceToBackingFile();
+
             DisposeSource();
-            File.Replace(temp, full, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            unmapped = true;
+
+            if (!atomic)
+            {
+                File.Copy(temp, full, overwrite: true);
+                TryDelete(temp);
+            }
+            else if (File.Exists(full))
+            {
+                File.Replace(temp, full, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(temp, full);
+            }
+
+            replaced = true;
+            AdoptBacking(backing);
+            backing = null;
         }
         catch
         {
             TryDelete(temp);
-            if (_source is EmptyByteSource)
-                _source = MappedByteSource.Open(full);
+            if (!replaced && unmapped && _source is EmptyByteSource)
+                RemapAfterFailedSave(full, ref backing);
+            if (!replaced && backing is not null)
+                TryDelete(backing);
+            else if (replaced && backing is not null)
+                _backingPath = backing;
             throw;
         }
-
-        ReopenClean(full);
     }
 
-    private void ReopenClean(string full)
+    private void AdoptBacking(string? backing)
     {
-        _undo.Clear();
-        _redo.Clear();
-        DisposeSource();
-        _source = MappedByteSource.Open(full);
-        _add.Truncate(0);
-        _table.Clear();
-        _index.Reset();
-        LoadOriginal(ReadPrefix(_source));
-        _revision = 0;
-        _savedRevision = 0;
-        FilePath = full;
+        if (backing is null)
+        {
+            _sourcePath = null;
+            return;
+        }
+        _source = MappedByteSource.Open(backing);
+        _sourcePath = backing;
+        _backingPath = backing;
+    }
+
+    private void RemapAfterFailedSave(string full, ref string? backing)
+    {
+        try
+        {
+            _source = MappedByteSource.Open(full);
+            _sourcePath = full;
+            return;
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        if (backing is null)
+            return;
+        try
+        {
+            _source = MappedByteSource.Open(backing);
+            _sourcePath = backing;
+            _backingPath = backing;
+            backing = null;
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private bool HistoryReferencesOriginal()
+    {
+        if (PiecesReferenceOriginal(_table.ToArray()))
+            return true;
+        foreach (var entry in _undo)
+        {
+            if (PiecesReferenceOriginal(entry.Pieces))
+                return true;
+        }
+        foreach (var entry in _redo)
+        {
+            if (PiecesReferenceOriginal(entry.Pieces))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool PiecesReferenceOriginal(Piece[] pieces)
+    {
+        foreach (var piece in pieces)
+        {
+            if (piece.Source == PieceSource.Original && piece.Length > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private string CopySourceToBackingFile()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "editor-backing-" + Guid.NewGuid().ToString("n"));
+        var buffer = ArrayPool<byte>.Shared.Rent(1024 * 1024);
+        try
+        {
+            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, buffer.Length, FileOptions.SequentialScan);
+            long position = 0;
+            while (position < _source.Length)
+            {
+                var count = (int)Math.Min(buffer.Length, _source.Length - position);
+                _source.CopyTo(position, buffer.AsSpan(0, count));
+                stream.Write(buffer, 0, count);
+                position += count;
+            }
+            stream.Flush(flushToDisk: true);
+        }
+        catch
+        {
+            TryDelete(path);
+            throw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+        return path;
     }
 
     private void DisposeSource()

@@ -16,11 +16,17 @@ internal static class EncodingDetector
 
         // A BOM-less file is UTF-8 when the examined bytes are strict UTF-8.
         // Large files are classified from the prefix so open stays proportional
-        // to the first page. Unmodified save still writes the original bytes.
-        if (Utf8Validator.IsValid(sample))
-            return TextEncodingProfile.Utf8(ansiCodePage);
+        // to the first page. The result is provisional until a modifying save
+        // rechecks the rest of the original bytes.
+        var valid = Utf8Validator.IsValid(sample, allowTrailingIncomplete: !sampleIsEntireFile);
+        if (valid)
+        {
+            return TextEncodingProfile.Utf8(ansiCodePage) with
+            {
+                IsProvisional = !sampleIsEntireFile
+            };
+        }
 
-        _ = sampleIsEntireFile;
         return TextEncodingProfile.Ansi(ansiCodePage);
     }
 }

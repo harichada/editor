@@ -14,11 +14,10 @@ public sealed record EditorSettings
     public FeatureSettings Features { get; init; } = new();
 
     /// <summary>
-    /// Code page used when a file is detected as ANSI. 1252 is the default so
-    /// detection is stable on hosts whose system ANSI page is UTF-8.
-    /// The Windows shell substitutes the active code page when it is a real ANSI page.
+    /// Code page used when a file is detected as ANSI. This is the system ANSI page,
+    /// or 1252 when the host has no ANSI page.
     /// </summary>
-    public int AnsiCodePage { get; init; } = 1252;
+    public int AnsiCodePage { get; init; } = SystemCodePage.Ansi;
 
     /// <summary>Line ending inserted by Enter when the file has no breaks yet.</summary>
     public LineEndingKind DefaultLineEnding { get; init; } = LineEndingKind.Crlf;

@@ -44,6 +44,15 @@ internal sealed class PieceTable
 
     public Piece[] ToArray() => _pieces.ToArray();
 
+    public void RetagOriginal(BufferEncoding encoding)
+    {
+        for (var i = 0; i < _pieces.Count; i++)
+        {
+            if (_pieces[i].Source == PieceSource.Original)
+                _pieces[i] = _pieces[i] with { Encoding = encoding };
+        }
+    }
+
     public void Insert(long offset, Piece piece)
     {
         if (piece.Length == 0)

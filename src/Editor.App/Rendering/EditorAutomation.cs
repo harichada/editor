@@ -97,7 +97,7 @@ public sealed class EditorAutomationPeer : FrameworkElementAutomationPeer, IText
 
     public ITextRangeProvider GetCaretRange(out bool isActive)
     {
-        isActive = _surface.IsKeyboardFocusWithin;
+        isActive = _surface.HasKeyboardFocus;
         var caret = Model?.GetCaret() ?? 0;
         return new EditorTextRange(this, caret, caret);
     }

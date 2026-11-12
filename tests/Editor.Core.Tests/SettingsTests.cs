@@ -74,6 +74,15 @@ public class SettingsTests
     }
 
     [Fact]
+    public void Default_ansi_code_page_is_the_system_page()
+    {
+        Assert.Equal(SystemCodePage.Ansi, new EditorSettings().AnsiCodePage);
+        Assert.Equal(SystemCodePage.Ansi, EditorSettings.AllEnabled().AnsiCodePage);
+        Assert.Equal(SystemCodePage.Ansi, EditorSettings.CreateDefault().AnsiCodePage);
+        Assert.InRange(SystemCodePage.Ansi, 1, 65000);
+    }
+
+    [Fact]
     public void Invalid_json_is_rejected()
     {
         Assert.Throws<FormatException>(() => EditorSettings.Parse("{"));

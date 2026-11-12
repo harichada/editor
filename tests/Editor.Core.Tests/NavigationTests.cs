@@ -63,6 +63,42 @@ public class GraphemeAndNavigationTests
         Assert.Equal(0, session.CaretLine);
     }
 
+    [Fact]
+    public void Jumps_in_a_large_file_do_not_scan_from_the_start()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "editor-jump-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "wide.txt");
+        var line = System.Text.Encoding.UTF8.GetBytes(new string('a', 79) + "\n");
+        using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            for (var i = 0; i < 30_000; i++)
+                stream.Write(line);
+        }
+
+        using var document = TextDocument.Open(path);
+        var scanned = document.ScannedBytes;
+        var end = document.JumpToEnd();
+        var far = document.JumpToLine(20_000);
+        var fraction = document.JumpToFraction(0.9);
+        Assert.Equal(scanned, document.ScannedBytes);
+        Assert.False(document.IsLineIndexComplete);
+        Assert.False(end.Exact);
+        Assert.True(end.BytesTouched < 64 * 1024);
+        Assert.True(far.BytesTouched < 64 * 1024);
+        Assert.True(fraction.BytesTouched < 64 * 1024);
+        Assert.Equal(document.ByteLength, end.CaretByte);
+        Assert.True(end.LineStart >= document.ByteLength - line.Length);
+        Assert.True(end.Preview.Length == 0 || end.Preview.StartsWith("a"));
+
+        var session = new EditingSession(document);
+        session.Move(CaretMove.DocumentEnd, false);
+        Assert.True(session.HasRemoteCaret);
+        Assert.False(document.IsLineIndexComplete);
+        Assert.True(session.GoToLine(18_000));
+        Assert.False(document.IsLineIndexComplete);
+    }
+
     [Theory]
     [MemberData(nameof(FeatureModes.All), MemberType = typeof(FeatureModes))]
     public void Go_to_line_and_status_follow_flags(EditorSettings settings)

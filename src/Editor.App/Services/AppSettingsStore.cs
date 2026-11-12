@@ -25,13 +25,6 @@ internal static class AppSettingsStore
         {
         }
 
-        var settings = EditorSettings.CreateDefault();
-        if (OperatingSystem.IsWindows())
-        {
-            var page = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ANSICodePage;
-            if (page is > 0 and < 65001)
-                settings = settings with { AnsiCodePage = page };
-        }
-        return settings;
+        return EditorSettings.CreateDefault() with { AnsiCodePage = SystemCodePage.Ansi };
     }
 }

@@ -74,9 +74,12 @@ public class AtomicSaveTests
         }
     }
 
-    [Fact]
-    public void Mapped_edit_saves_without_keeping_the_previous_undo_chain()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Mapped_self_save_keeps_undo_and_the_bytes(bool atomic)
     {
+        var settings = EditorSettings.WithFeature(FeatureNames.AtomicSave, atomic);
         var directory = Path.Combine(Path.GetTempPath(), "editor-map-" + Guid.NewGuid().ToString("n"));
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "large.txt");
@@ -86,19 +89,38 @@ public class AtomicSaveTests
             bytes[i] = (byte)(i % 80 == 79 ? '\n' : 'a');
         File.WriteAllBytes(path, bytes);
 
-        using (var document = TextDocument.Open(path))
+        using (var document = TextDocument.Open(path, settings))
         {
             Assert.True(document.ByteLength >= TextDocument.MapThreshold);
             var session = new EditingSession(document);
             session.InsertText("Z");
             document.Save(path);
-            Assert.False(document.CanUndo);
+
+            Assert.True(document.CanUndo);
+            Assert.False(document.IsModified);
             Assert.StartsWith("Z", document.GetLineContent(0));
+            Assert.Equal((byte)'Z', File.ReadAllBytes(path)[0]);
+            Assert.Equal(size + 1, new FileInfo(path).Length);
+
+            Assert.True(document.Undo());
+            Assert.True(document.CanRedo);
+            Assert.True(document.IsModified);
+            Assert.StartsWith("a", document.GetLineContent(0));
+            Assert.DoesNotContain('Z', document.GetLineContent(0));
+            Assert.Equal((byte)'Z', File.ReadAllBytes(path)[0]);
+
+            Assert.True(document.Redo());
+            Assert.False(document.IsModified);
+            Assert.StartsWith("Z", document.GetLineContent(0));
+            Assert.Equal((byte)'Z', File.ReadAllBytes(path)[0]);
+
+            Assert.True(document.Undo());
+            document.Save(path);
+            Assert.Equal((byte)'a', File.ReadAllBytes(path)[0]);
+            Assert.Equal(size, new FileInfo(path).Length);
         }
 
-        var saved = File.ReadAllBytes(path);
-        Assert.Equal((byte)'Z', saved[0]);
-        Assert.True(saved.Length > size / 2);
+        Assert.Empty(Directory.GetFiles(directory, "*.tmp"));
     }
 
     [Fact]

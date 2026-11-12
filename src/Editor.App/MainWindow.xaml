@@ -15,7 +15,11 @@
     <MenuBar x:Name="Menu" Grid.Row="0"/>
     <render:EditorSurface x:Name="Surface" Grid.Row="1"/>
 
-    <Grid x:Name="FindBar" Grid.Row="2" Padding="12,8" ColumnSpacing="8" Visibility="Collapsed">
+    <Grid x:Name="FindBar" Grid.Row="2" Padding="12,8" ColumnSpacing="8" RowSpacing="6" Visibility="Collapsed">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="*"/>
@@ -32,6 +36,7 @@
       <Button Grid.Column="4" Content="Replace" Click="OnReplaceOne"/>
       <Button Grid.Column="5" Content="Replace all" Click="OnReplaceAll"/>
       <Button Grid.Column="6" Content="Close" Click="OnCloseFind"/>
+      <TextBlock x:Name="FindStatus" Grid.Row="1" Grid.ColumnSpan="7" Opacity="0.8"/>
     </Grid>
 
     <Grid x:Name="StatusBar" Grid.Row="3" Padding="12,6" ColumnSpacing="18">

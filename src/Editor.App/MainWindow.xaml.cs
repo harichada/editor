@@ -16,6 +16,8 @@ public sealed partial class MainWindow : Window
     private readonly string? _benchmarkPath;
     private readonly DispatcherTimer? _benchmarkFallback;
     private EditingSession _session;
+    private CancellationTokenSource? _findCancel;
+    private int _findGeneration;
     private bool _allowClose;
     private bool _closing;
     private bool _benchmarkDone;
@@ -32,7 +34,11 @@ public sealed partial class MainWindow : Window
         BuildMenu();
         ApplyFeatureVisibility();
         Surface.Attach(_session);
-        Surface.DocumentChanged += (_, _) => UpdateChrome();
+        Surface.DocumentChanged += (_, _) =>
+        {
+            _findCancel?.Cancel();
+            UpdateChrome();
+        };
         Surface.FirstFrameRendered += (_, _) => FinishBenchmark("first-frame");
         AppWindow.Closing += OnClosing;
         Closed += (_, _) => _session.Document.Dispose();
@@ -121,10 +127,11 @@ public sealed partial class MainWindow : Window
         var status = _session.Document.TryGetStatus(_session.CaretLine, _session.CaretColumn);
         if (status is null)
             return;
-        LineColumnText.Text = $"Line {status.Line}, Column {status.Column}";
-        EncodingText.Text = status.Encoding;
-        EndingButton.Content = status.LineEnding;
-        ModifiedText.Text = status.Modified ? "Modified" : string.Empty;
+        var current = status.Value;
+        LineColumnText.Text = $"Line {current.Line}, Column {current.Column}";
+        EncodingText.Text = current.Encoding;
+        EndingButton.Content = current.LineEnding;
+        ModifiedText.Text = current.Modified ? "Modified" : string.Empty;
     }
 
     private async void OnNew(object sender, RoutedEventArgs e)
@@ -217,6 +224,8 @@ public sealed partial class MainWindow : Window
 
     private void OnCloseFind(object sender, RoutedEventArgs e)
     {
+        _findCancel?.Cancel();
+        FindStatus.Text = string.Empty;
         FindBar.Visibility = Visibility.Collapsed;
         Surface.Focus(FocusState.Programmatic);
     }
@@ -235,30 +244,47 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void OnFindNext(object sender, RoutedEventArgs e)
+    private void OnFindNext(object sender, RoutedEventArgs e) => _ = FindNextAsync();
+
+    private async Task FindNextAsync()
     {
         if (!_settings.Features.FindReplace)
             return;
         var pattern = FindBox.Text ?? string.Empty;
         if (pattern.Length == 0)
-            return;
-        var matches = _session.Document.Find(pattern, new FindOptions(MatchCaseBox.IsChecked == true));
-        if (matches.Count == 0)
-            return;
-        var caret = _session.CaretUtf16;
-        var chosen = matches[0];
-        foreach (var match in matches)
         {
-            if (match.Start >= caret && !(match.Start == caret && _session.HasSelection))
-            {
-                chosen = match;
-                break;
-            }
+            FindStatus.Text = string.Empty;
+            return;
         }
-        _session.PlaceUtf16(chosen.Start, extend: false);
-        _session.PlaceUtf16(chosen.Start + chosen.Length, extend: true);
-        Surface.RevealCaret();
-        UpdateChrome();
+
+        var generation = ++_findGeneration;
+        var token = BeginFind();
+        var options = new FindOptions(MatchCaseBox.IsChecked == true);
+        var from = _session.CaretUtf16;
+        var document = _session.Document;
+        FindStatus.Text = "Searching…";
+        try
+        {
+            var match = await Task.Run(() => document.FindNext(pattern, options, from, token), token);
+            if (generation != _findGeneration || token.IsCancellationRequested)
+                return;
+            if (match is null)
+            {
+                FindStatus.Text = "No matches";
+                return;
+            }
+
+            FindStatus.Text = string.Empty;
+            _session.PlaceUtf16(match.Value.Start, extend: false);
+            _session.PlaceUtf16(match.Value.Start + match.Value.Length, extend: true);
+            Surface.RevealCaret();
+            UpdateChrome();
+        }
+        catch (OperationCanceledException)
+        {
+            if (generation == _findGeneration)
+                FindStatus.Text = "Search cancelled";
+        }
     }
 
     private void OnReplaceOne(object sender, RoutedEventArgs e)
@@ -268,20 +294,51 @@ public sealed partial class MainWindow : Window
         var pattern = FindBox.Text ?? string.Empty;
         var comparison = MatchCaseBox.IsChecked == true ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
         if (pattern.Length > 0 && _session.GetSelectedText().Equals(pattern, comparison))
+        {
             _session.InsertText(ReplaceBox.Text ?? string.Empty);
-        OnFindNext(sender, e);
-        Surface.InvalidateView();
+            Surface.InvalidateView();
+        }
+        _ = FindNextAsync();
     }
 
-    private void OnReplaceAll(object sender, RoutedEventArgs e)
+    private async void OnReplaceAll(object sender, RoutedEventArgs e)
     {
         if (!_settings.Features.FindReplace)
             return;
         var pattern = FindBox.Text ?? string.Empty;
         if (pattern.Length == 0)
+        {
+            FindStatus.Text = string.Empty;
             return;
-        _session.Document.ReplaceAll(pattern, ReplaceBox.Text ?? string.Empty, new FindOptions(MatchCaseBox.IsChecked == true));
-        Surface.InvalidateView();
+        }
+
+        var generation = ++_findGeneration;
+        var token = BeginFind();
+        var options = new FindOptions(MatchCaseBox.IsChecked == true);
+        var replacement = ReplaceBox.Text ?? string.Empty;
+        var document = _session.Document;
+        FindStatus.Text = "Replacing…";
+        try
+        {
+            var count = await Task.Run(() => document.ReplaceAll(pattern, replacement, options, token), token);
+            if (generation != _findGeneration || token.IsCancellationRequested)
+                return;
+            FindStatus.Text = count == 0 ? "No matches" : $"Replaced {count}";
+            Surface.InvalidateView();
+        }
+        catch (OperationCanceledException)
+        {
+            if (generation == _findGeneration)
+                FindStatus.Text = "Search cancelled";
+        }
+    }
+
+    private CancellationToken BeginFind()
+    {
+        _findCancel?.Cancel();
+        _findCancel?.Dispose();
+        _findCancel = new CancellationTokenSource();
+        return _findCancel.Token;
     }
 
     private async void OnGoTo(object sender, RoutedEventArgs e)
@@ -307,9 +364,8 @@ public sealed partial class MainWindow : Window
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)
             return;
-        if (_session.Document.TryGoToLine((int)box.Value, out var line))
+        if (_session.GoToLine((int)box.Value))
         {
-            _session.SetCaret(line, 0, extend: false);
             Surface.RevealCaret();
             UpdateChrome();
         }
@@ -338,8 +394,12 @@ public sealed partial class MainWindow : Window
     private async Task<bool> SaveAsync(bool saveAs)
     {
         var path = _session.Document.FilePath;
+        SaveFormat? format = null;
         if (saveAs || string.IsNullOrEmpty(path))
         {
+            format = await PickSaveFormatAsync();
+            if (format is null)
+                return false;
             var picker = new FileSavePicker();
             picker.FileTypeChoices.Add("Text", [".txt"]);
             picker.FileTypeChoices.Add("All files", [".*"]);
@@ -354,7 +414,14 @@ public sealed partial class MainWindow : Window
         }
         try
         {
-            _session.Document.Save(path);
+            if (format is { } chosen)
+            {
+                var endings = _session.Document.LineEndings;
+                if (endings.IsMixed || endings.Preferred != chosen.Ending)
+                    _session.Document.ConvertLineEndings(chosen.Ending);
+                _session.Document.SetEncoding(chosen.Kind, chosen.Bom);
+            }
+            _session.Document.Save(path!);
             Surface.InvalidateView();
             return true;
         }
@@ -363,6 +430,69 @@ public sealed partial class MainWindow : Window
             await AlertAsync(ex.Message);
             return false;
         }
+    }
+
+    private readonly record struct SaveFormat(TextEncodingKind Kind, bool Bom, LineEndingKind Ending);
+
+    private async Task<SaveFormat?> PickSaveFormatAsync()
+    {
+        var encoding = new ComboBox { MinWidth = 240 };
+        encoding.Items.Add("UTF-8");
+        encoding.Items.Add("UTF-8 with BOM");
+        encoding.Items.Add("UTF-16 LE");
+        encoding.Items.Add("UTF-16 BE");
+        encoding.Items.Add($"ANSI ({_session.Document.Encoding.AnsiCodePage})");
+        encoding.SelectedIndex = _session.Document.Encoding.Kind switch
+        {
+            TextEncodingKind.Utf16Le => 2,
+            TextEncodingKind.Utf16Be => 3,
+            TextEncodingKind.Ansi => 4,
+            _ => _session.Document.Encoding.HasBom ? 1 : 0
+        };
+
+        var endings = new ComboBox { MinWidth = 240 };
+        endings.Items.Add("CRLF");
+        endings.Items.Add("LF");
+        endings.Items.Add("CR");
+        endings.SelectedIndex = _session.Document.LineEndings.Preferred switch
+        {
+            LineEndingKind.Lf => 1,
+            LineEndingKind.Cr => 2,
+            _ => 0
+        };
+
+        var panel = new StackPanel { Spacing = 8 };
+        panel.Children.Add(new TextBlock { Text = "Encoding" });
+        panel.Children.Add(encoding);
+        panel.Children.Add(new TextBlock { Text = "Line ending" });
+        panel.Children.Add(endings);
+        var dialog = new ContentDialog
+        {
+            Title = "Save as",
+            Content = panel,
+            PrimaryButtonText = "Continue",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            return null;
+
+        var (kind, bom) = encoding.SelectedIndex switch
+        {
+            1 => (TextEncodingKind.Utf8, true),
+            2 => (TextEncodingKind.Utf16Le, true),
+            3 => (TextEncodingKind.Utf16Be, true),
+            4 => (TextEncodingKind.Ansi, false),
+            _ => (TextEncodingKind.Utf8, false)
+        };
+        var ending = endings.SelectedIndex switch
+        {
+            1 => LineEndingKind.Lf,
+            2 => LineEndingKind.Cr,
+            _ => LineEndingKind.Crlf
+        };
+        return new SaveFormat(kind, bom, ending);
     }
 
     private async Task<bool> ConfirmDiscardAsync()

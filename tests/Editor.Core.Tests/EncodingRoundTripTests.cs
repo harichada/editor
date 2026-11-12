@@ -54,7 +54,7 @@ public class EncodingRoundTripTests
     public void Ansi_invalid_utf8_is_detected_and_edited_save_uses_code_page()
     {
         var bytes = new byte[] { 0x93 };
-        using var document = TextDocument.FromBytes(bytes);
+        using var document = TextDocument.FromBytes(bytes, new EditorSettings { AnsiCodePage = 1252 });
         Assert.Equal(TextEncodingKind.Ansi, document.Encoding.Kind);
         Assert.Equal("\u201C", document.GetText());
         var session = new EditingSession(document);
@@ -102,6 +102,78 @@ public class EncodingRoundTripTests
         using var document = TextDocument.FromBytes(bytes, settings);
         Assert.Equal(TextEncodingKind.Utf16Le, document.Encoding.Kind);
         Assert.Equal("A", document.GetText());
+    }
+
+    [Fact]
+    public void Provisional_guess_keeps_unedited_bytes_when_the_rest_of_the_file_is_not_utf8()
+    {
+        var bytes = new byte[(64 * 1024) + 8];
+        Array.Fill(bytes, (byte)'a');
+        bytes[^3] = 0x93;
+        bytes[^2] = (byte)'b';
+        bytes[^1] = (byte)'c';
+        var source = TestFiles.NewFile(bytes);
+        var dest = TestFiles.NewFile([]);
+        using var document = TextDocument.Open(source, new EditorSettings { AnsiCodePage = 1252 });
+        Assert.Equal(TextEncodingKind.Utf8, document.Encoding.Kind);
+        Assert.True(document.Encoding.IsProvisional);
+        document.InsertAtUtf16(0, "Z");
+        document.Save(dest);
+        var saved = File.ReadAllBytes(dest);
+        Assert.Equal((byte)'Z', saved[0]);
+        Assert.Contains((byte)0x93, saved);
+        Assert.Equal((byte)'b', saved[^2]);
+        Assert.Equal(-1, IndexOf(saved, [0xEF, 0xBF, 0xBD]));
+    }
+
+    [Fact]
+    public void Provisional_utf8_keeps_a_multibyte_character_past_the_sample()
+    {
+        var bytes = new byte[(64 * 1024) + 4];
+        Array.Fill(bytes, (byte)'a');
+        bytes[^2] = 0xC3;
+        bytes[^1] = 0xA9;
+        var source = TestFiles.NewFile(bytes);
+        var dest = TestFiles.NewFile([]);
+        using var document = TextDocument.Open(source);
+        Assert.True(document.Encoding.IsProvisional);
+        document.InsertAtUtf16(0, "Q");
+        document.Save(dest);
+        var saved = File.ReadAllBytes(dest);
+        Assert.Equal((byte)'Q', saved[0]);
+        Assert.Equal((byte)0xC3, saved[^2]);
+        Assert.Equal((byte)0xA9, saved[^1]);
+    }
+
+    [Fact]
+    public void Save_as_encoding_transcodes_the_whole_document()
+    {
+        using var document = TextDocument.FromText("hi", new EditorSettings { AnsiCodePage = 1252 });
+        document.SetEncoding(TextEncodingKind.Utf16Le, bom: true);
+        Assert.True(document.IsModified);
+        var dest = TestFiles.NewFile([]);
+        document.Save(dest);
+        Assert.Equal(new byte[] { 0xFF, 0xFE, 0x68, 0x00, 0x69, 0x00 }, File.ReadAllBytes(dest));
+        Assert.False(document.IsModified);
+    }
+
+    private static int IndexOf(byte[] data, byte[] pattern)
+    {
+        for (var i = 0; i <= data.Length - pattern.Length; i++)
+        {
+            var match = true;
+            for (var j = 0; j < pattern.Length; j++)
+            {
+                if (data[i + j] != pattern[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match)
+                return i;
+        }
+        return -1;
     }
 
     [Fact]

@@ -67,6 +67,9 @@ public class RendererModelTests
         input.CompleteComposition();
         Assert.False(input.IsComposing);
         Assert.Equal("go你", document.GetText());
+        Assert.True(document.Undo());
+        Assert.Equal("go", document.GetText());
+        Assert.True(document.Redo());
 
         input.BeginComposition();
         input.UpdateComposition("x");

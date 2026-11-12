@@ -193,7 +193,7 @@ internal static class TextDecoder
 
 internal static class Utf8Validator
 {
-    public static bool IsValid(ReadOnlySpan<byte> data)
+    public static bool IsValid(ReadOnlySpan<byte> data, bool allowTrailingIncomplete = false)
     {
         var index = 0;
         while (index < data.Length)
@@ -216,7 +216,7 @@ internal static class Utf8Validator
                 return false;
 
             if (index + needed >= data.Length)
-                return false;
+                return allowTrailingIncomplete && index + needed >= data.Length && IncompleteTail(data, index);
 
             for (var extra = 1; extra <= needed; extra++)
             {
@@ -242,6 +242,16 @@ internal static class Utf8Validator
             index += needed + 1;
         }
 
+        return true;
+    }
+
+    private static bool IncompleteTail(ReadOnlySpan<byte> data, int index)
+    {
+        for (var i = index + 1; i < data.Length; i++)
+        {
+            if ((data[i] & 0xC0) != 0x80)
+                return false;
+        }
         return true;
     }
 }

@@ -24,6 +24,7 @@ public sealed partial class EditorSurface : UserControl
     private bool _dragging;
     private bool _firstFrame;
     private int _scrollLine;
+    private long _anchorByte = -1;
     private int _scrollColumn;
     private float _charWidth = 9;
     private float _lineHeight = 20;
@@ -59,8 +60,18 @@ public sealed partial class EditorSurface : UserControl
         ActualThemeChanged += (_, _) => Canvas.Invalidate();
         KeyDown += OnKeyDown;
         CharacterReceived += OnCharacterReceived;
-        GotFocus += (_, _) => _input?.FocusEntered();
-        LostFocus += (_, _) => _input?.FocusLeft();
+        GotFocus += (_, _) =>
+        {
+            HasKeyboardFocus = true;
+            _input?.FocusEntered();
+            Canvas.Invalidate();
+        };
+        LostFocus += (_, _) =>
+        {
+            HasKeyboardFocus = false;
+            _input?.FocusLeft();
+            Canvas.Invalidate();
+        };
         Canvas.PointerPressed += OnPointerPressed;
         Canvas.PointerMoved += OnPointerMoved;
         Canvas.PointerReleased += OnPointerReleased;
@@ -72,6 +83,7 @@ public sealed partial class EditorSurface : UserControl
     public event EventHandler? FirstFrameRendered;
 
     public EditingSession? Session => _session;
+    public bool HasKeyboardFocus { get; private set; }
     public int FirstVisibleLine => _scrollLine;
     public int VisibleLineCount => Math.Max(1, _visibleLines);
     public bool InputAvailable => _input?.IsAvailable == true;
@@ -190,6 +202,17 @@ public sealed partial class EditorSurface : UserControl
             return;
 
         _session.PageLineCount = Math.Max(1, _visibleLines);
+        if (_anchorByte >= 0)
+        {
+            DrawFromAnchor(args, foreground, selection, caret);
+            if (!_firstFrame)
+            {
+                _firstFrame = true;
+                FirstFrameRendered?.Invoke(this, EventArgs.Empty);
+            }
+            return;
+        }
+
         var estimated = ViewportLayout.EstimateLineCount(
             _session.Document.ByteLength,
             _session.Document.ScannedBytes,
@@ -220,7 +243,7 @@ public sealed partial class EditorSurface : UserControl
             DrawComposition(args, line, content, y, underline);
         }
 
-        if (_caretOn && IsKeyboardFocusWithin)
+        if (_caretOn && HasKeyboardFocus)
         {
             var local = CaretLocalRect();
             if (local.Y >= Pad - 1 && local.Y < sender.ActualHeight)
@@ -486,10 +509,45 @@ public sealed partial class EditorSurface : UserControl
         Clipboard.SetContent(package);
     }
 
+    private void DrawFromAnchor(CanvasDrawEventArgs args, Color foreground, Color selection, Color caret)
+    {
+        if (_session is null || _format is null)
+            return;
+        var page = _session.Document.LayoutAround(_anchorByte, _visibleLines, _visibleColumns + 8);
+        for (var row = 0; row < page.Lines.Count; row++)
+        {
+            var line = page.Lines[row];
+            var y = (float)(Pad + (row * _lineHeight));
+            foreach (var cell in MonospaceLayout.VisibleCells(line.Text, _scrollColumn, _visibleColumns + 1))
+            {
+                var x = (float)(Pad + ((cell.Column - _scrollColumn) * _charWidth));
+                args.DrawingSession.DrawText(cell.Text, x, y, foreground, _format);
+            }
+        }
+
+        if (_caretOn && HasKeyboardFocus && _session.HasRemoteCaret && page.Lines.Count > 0)
+        {
+            var column = DisplayColumn.Get(page.Lines[0].Text, Math.Min(_session.CaretColumn, page.Lines[0].Text.Length));
+            var x = (float)(Pad + ((column - _scrollColumn) * _charWidth));
+            args.DrawingSession.FillRectangle(x, (float)Pad, 2, (float)_lineHeight, caret);
+        }
+
+        _ = selection;
+    }
+
     private void EnsureCaretVisible()
     {
         if (_session is null)
             return;
+        if (_session.HasRemoteCaret)
+        {
+            _anchorByte = _session.RemoteViewByte;
+            _scrollLine = _session.CaretLine;
+            SyncScrollBars();
+            return;
+        }
+
+        _anchorByte = -1;
         if (_session.CaretLine < _scrollLine)
             _scrollLine = _session.CaretLine;
         else if (_session.CaretLine >= _scrollLine + Math.Max(1, _visibleLines))
@@ -542,9 +600,22 @@ public sealed partial class EditorSurface : UserControl
 
     private void OnVerticalScroll(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
-        if (_scrollInternal)
+        if (_scrollInternal || _session is null)
             return;
-        _scrollLine = Math.Max(0, (int)e.NewValue);
+        var value = Math.Max(0, (int)e.NewValue);
+        var document = _session.Document;
+        if (!document.IsLineIndexComplete && value > document.CompleteLineCount + 2)
+        {
+            var maximum = Math.Max(1d, VerticalBar.Maximum);
+            var jump = document.JumpToFraction(value / maximum);
+            _anchorByte = jump.LineStart;
+            _scrollLine = jump.Line;
+        }
+        else
+        {
+            _anchorByte = -1;
+            _scrollLine = value;
+        }
         Canvas.Invalidate();
     }
 
@@ -559,6 +630,8 @@ public sealed partial class EditorSurface : UserControl
     private string SafeLine(int line)
     {
         if (_session is null)
+            return string.Empty;
+        if (_anchorByte >= 0 || (_session.Document.ByteLength > 256 * 1024 && line > _session.Document.CompleteLineCount + 8))
             return string.Empty;
         _session.Document.EnsureLines(line + 1);
         if (line < 0 || line >= _session.Document.CompleteLineCount)

@@ -30,12 +30,13 @@ Settings live in `%LocalAppData%\Editor\settings.json`. Missing or unreadable se
 
 - Open and save a UTF-8 file, a UTF-8 file with BOM, UTF-16 LE with BOM, UTF-16 BE with BOM, and an ANSI file. The status encoding matches. Save without an edit and the bytes are unchanged, including an empty file, a file with no trailing newline, and a file that contains NUL.
 - CRLF, LF, CR, and mixed files keep their breaks across an unedited save. The status names the ending. Choosing another ending converts, and undo restores the previous breaks.
-- Save As writes the chosen path. A read-only or locked target leaves the original file intact and shows an error.
+- Save As asks for an encoding (UTF-8, UTF-8 with BOM, UTF-16 LE, UTF-16 BE, ANSI) and a line ending (CRLF, LF, CR), then writes the chosen path. A read-only or locked target leaves the original file intact and shows an error. Drag-and-drop is not in this slice.
 - A file of about 100 MB shows its first page without a long wait. Scrolling is the thing that indexes further lines.
 
 ## Find, go to, status
 
-- Ctrl+F shows the find bar. Next, replace, and replace all are literal. Match case is honored. There is no regular-expression control.
+- Ctrl+F shows the find bar. Next, replace, and replace all are literal and cover the whole file, including a match past the first 64 MiB. The bar says "Searching…" or "Replacing…" while that work runs, and "No matches" when the pattern is absent. Match case is honored. There is no regular-expression control.
+- Open a file larger than 1 MiB, type a character, save over that file, then undo and redo. The in-memory text follows the undo stack. The file on disk stays at the saved bytes until the next save.
 - Ctrl+G asks for a line and moves there.
 - The status bar shows 1-based line and column, the encoding, and the line ending.
 - With `findReplace` off, the Find command is absent and the bar cannot be opened.

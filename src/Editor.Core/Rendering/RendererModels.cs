@@ -203,6 +203,8 @@ public sealed class TextPatternModel
 
     private int DocumentEnd()
     {
+        if (Session.Document.ByteLength > TextDocument.MaterializeLimit)
+            return 8192;
         Session.Document.EnsureLines(int.MaxValue);
         var lines = Session.Document.CompleteLineCount;
         if (lines <= 0)
@@ -271,7 +273,7 @@ public sealed class TextInputModel
         text ??= string.Empty;
         if (!_composing)
             BeginComposition();
-        _session.Document.ReplaceUtf16(_compositionStart, _compositionLength, text);
+        _session.Document.CoalescedReplaceUtf16(_compositionStart, _compositionLength, text);
         _compositionLength = text.Length;
         _session.PlaceUtf16(_compositionStart + text.Length, extend: false);
     }
@@ -287,6 +289,7 @@ public sealed class TextInputModel
 
         if (finalText is not null && finalText != CurrentCompositionText())
             UpdateComposition(finalText);
+        _session.Document.EndCoalescedEdit();
         _composing = false;
         _compositionLength = 0;
     }
@@ -295,11 +298,8 @@ public sealed class TextInputModel
     {
         if (!_composing)
             return;
-        if (_compositionLength > 0)
-        {
-            _session.Document.ReplaceUtf16(_compositionStart, _compositionLength, string.Empty);
-            _session.PlaceUtf16(_compositionStart, extend: false);
-        }
+        _session.Document.AbortCoalescedEdit();
+        _session.PlaceUtf16(_compositionStart, extend: false);
         _composing = false;
         _compositionLength = 0;
     }
@@ -310,13 +310,17 @@ public sealed class TextInputModel
         text ??= string.Empty;
         var start = Math.Min(replaceStart, replaceEnd);
         var end = Math.Max(replaceStart, replaceEnd);
-        _session.Document.ReplaceUtf16(start, end - start, text);
-        _session.PlaceUtf16(start + text.Length, extend: false);
         if (_composing)
         {
+            _session.Document.CoalescedReplaceUtf16(start, end - start, text);
             _compositionStart = start;
             _compositionLength = text.Length;
         }
+        else
+        {
+            _session.Document.ReplaceUtf16(start, end - start, text);
+        }
+        _session.PlaceUtf16(start + text.Length, extend: false);
     }
 
     private string CurrentCompositionText()

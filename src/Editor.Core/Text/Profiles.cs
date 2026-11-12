@@ -11,6 +11,12 @@ public readonly record struct TextEncodingProfile
     public bool HasBom { get; init; }
     public int AnsiCodePage { get; init; }
 
+    /// <summary>
+    /// True when the kind was chosen from a prefix. A modifying save rechecks the
+    /// whole original file before it encodes new text, and copies unedited bytes as they are.
+    /// </summary>
+    public bool IsProvisional { get; init; }
+
     public BufferEncoding PieceEncoding => Kind switch
     {
         TextEncodingKind.Utf16Le => BufferEncoding.Utf16Le,
