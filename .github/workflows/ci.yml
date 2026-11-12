@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests:
+    name: Core tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Unit tests
+        run: dotnet test tests/Editor.Core.Tests/Editor.Core.Tests.csproj -c Release --nologo
+
+  flag-matrix:
+    name: Flags ${{ matrix.disable }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        disable: [none, findReplace, goToLine, statusBar, atomicSave, encodingDetection]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Unit tests with one feature disabled
+        env:
+          EDITOR_DISABLE_FEATURES: ${{ matrix.disable }}
+        run: dotnet test tests/Editor.Core.Tests/Editor.Core.Tests.csproj -c Release --nologo
+
+  perf:
+    name: Performance gates
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Run gates
+        env:
+          PERF_RESULTS_PATH: ${{ github.workspace }}/artifacts/perf-results.json
+        run: dotnet test tests/Editor.Core.PerfTests/Editor.Core.PerfTests.csproj -c Release --nologo
+      - name: Upload perf results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: artifacts/perf-results.json
+          if-no-files-found: warn
+
+  package:
+    name: Package ${{ matrix.rid }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            platform: x64
+          - rid: win-arm64
+            platform: ARM64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish unsigned MSIX
+        run: >
+          dotnet publish src/Editor.App/Editor.App.csproj -c Release
+          -r ${{ matrix.rid }}
+          -p:Platform=${{ matrix.platform }}
+          -p:WindowsPackageType=MSIX
+          -p:AppxPackageSigningEnabled=false
+          -p:GenerateAppxPackageOnBuild=true
+          -p:BaseIntermediateOutputPath=obj/msix/
+          -p:AppxPackageDir=${{ github.workspace }}/artifacts/msix-${{ matrix.rid }}/
+      - name: Test-sign MSIX
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msix = Get-ChildItem "artifacts/msix-${{ matrix.rid }}" -Recurse -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { throw "No MSIX was produced." }
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=Editor Test" -KeyUsage DigitalSignature -FriendlyName "Editor test" -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+          $secret = [guid]::NewGuid().ToString("n")
+          $password = ConvertTo-SecureString -String $secret -Force -AsPlainText
+          $pfx = Join-Path $env:RUNNER_TEMP "editor-test.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
+          $kit = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $signtool = Join-Path $kit.FullName "x64\signtool.exe"
+          & $signtool sign /fd SHA256 /f $pfx /p $secret $msix.FullName
+      - name: Publish portable
+        run: >
+          dotnet publish src/Editor.App/Editor.App.csproj -c Release
+          -r ${{ matrix.rid }}
+          -p:Platform=${{ matrix.platform }}
+          -p:WindowsPackageType=None
+          -p:WindowsAppSDKSelfContained=true
+          -p:SelfContained=true
+          -p:GenerateAppxPackageOnBuild=false
+          -p:BaseIntermediateOutputPath=obj/portable/
+          -o ${{ github.workspace }}/artifacts/portable-${{ matrix.rid }}
+      - name: Zip portable
+        shell: pwsh
+        run: Compress-Archive -Path "${{ github.workspace }}/artifacts/portable-${{ matrix.rid }}/*" -DestinationPath "${{ github.workspace }}/artifacts/Editor-portable-${{ matrix.rid }}.zip"
+      - name: Upload MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-msix-${{ matrix.rid }}
+          path: artifacts/msix-${{ matrix.rid }}/**/*.msix
+          if-no-files-found: error
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-portable-${{ matrix.rid }}
+          path: artifacts/Editor-portable-${{ matrix.rid }}.zip
+          if-no-files-found: error
+
+  startup:
+    name: Cold start probe
+    runs-on: windows-latest
+    needs: package
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: editor-portable-win-x64
+          path: portable
+      - name: Measure startup when a window can be created
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $zip = Get-ChildItem portable -Filter *.zip | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath unpacked
+          $out = Join-Path (Get-Location) "artifacts/startup.json"
+          $exe = Join-Path (Get-Location) "unpacked/Editor.exe"
+          if (-not (Test-Path $exe)) {
+            '{"kind":"missing-exe","elapsedMs":null}' | Set-Content $out
+            exit 0
+          }
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process -FilePath $exe -ArgumentList @("--startup-benchmark", $out) -PassThru
+          if (-not $p.WaitForExit(25000)) {
+            $watch.Stop()
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path $out)) {
+              '{"kind":"timeout","elapsedMs":null,"note":"No usable window within 25s. Cold start is reported, not gated."}' | Set-Content $out
+            }
+          } else {
+            $watch.Stop()
+          }
+          Write-Host "outer elapsed ms: $($watch.Elapsed.TotalMilliseconds)"
+          if (Test-Path $out) { Get-Content $out }
+      - name: Upload startup report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-report
+          path: artifacts/startup.json
+          if-no-files-found: warn

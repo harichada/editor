@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="Editor.App.Rendering.EditorSurface"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:canvas="using:Microsoft.Graphics.Canvas.UI.Xaml"
+    IsTabStop="True"
+    UseSystemFocusVisuals="False"
+    AutomationProperties.Name="Document">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="Auto"/>
+    </Grid.ColumnDefinitions>
+    <canvas:CanvasControl x:Name="Canvas" Grid.Row="0" Grid.Column="0" Draw="OnDraw" IsTabStop="False"/>
+    <ScrollBar x:Name="VerticalBar" Grid.Row="0" Grid.Column="1" Orientation="Vertical" IndicatorMode="MouseIndicator" ViewportSize="1" ValueChanged="OnVerticalScroll"/>
+    <ScrollBar x:Name="HorizontalBar" Grid.Row="1" Grid.Column="0" Orientation="Horizontal" IndicatorMode="MouseIndicator" ViewportSize="8" ValueChanged="OnHorizontalScroll"/>
+  </Grid>
+</UserControl>
