@@ -16,6 +16,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>12</LangVersion>
     <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+    <GenerateAppxPackageOnBuild Condition="'$(WindowsPackageType)' == 'None'">false</GenerateAppxPackageOnBuild>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
     <PublishProfile>win-$(Platform).pubxml</PublishProfile>
   </PropertyGroup>
@@ -32,6 +33,10 @@
 
   <ItemGroup>
     <Content Include="Assets\*.png" />
+  </ItemGroup>
+
+  <!-- An unpackaged publish sets WindowsPackageType to None. The manifest item is only for MSIX. -->
+  <ItemGroup Condition="'$(WindowsPackageType)' != 'None'">
     <AppxManifest Include="Package.appxmanifest">
       <SubType>Designer</SubType>
     </AppxManifest>
